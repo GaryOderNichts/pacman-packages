@@ -4,7 +4,7 @@
 # Contributor: jakibaki <jakibaki live com>
 
 pkgname=switch-ffmpeg
-pkgver=4.3.1
+pkgver=6.0
 pkgrel=1
 pkgdesc='ffmpeg port (for Nintendo Switch homebrew development)'
 arch=('any')
@@ -14,16 +14,13 @@ options=(!strip staticlibs)
 makedepends=('switch-pkg-config' 'dkp-toolchain-vars')
 depends=('switch-zlib' 'switch-bzip2' 'switch-libass' 'switch-libfribidi'
          'switch-freetype')
-source=("https://ffmpeg.org/releases/ffmpeg-$pkgver.tar.xz" "ffmpeg.patch")
-sha256sums=(
- 'ad009240d46e307b4e03a213a0f49c11b650e445b1f8be0dda2a9212b34d2ffb'
- '8604ce3a949bc7dff33be66d5ea1d83ff01eed1fed3fbe89f199922d8101f5d8'
-)
+source=("https://ffmpeg.org/releases/ffmpeg-${pkgver}.tar.xz" "ffmpeg-${pkgver}.patch")
+
 groups=('switch-portlibs')
 
 prepare() {
   cd ffmpeg-$pkgver
-  patch -Np1 -i "$srcdir/ffmpeg.patch"
+  patch -Np1 -i "$srcdir/ffmpeg-${pkgver}.patch"
 }
 
 build() {
@@ -38,10 +35,11 @@ build() {
     --extra-cxxflags='-D__SWITCH__ -D_GNU_SOURCE -O2 -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIC -ftls-model=local-exec' \
     --extra-ldflags='-fPIE -L${PORTLIBS_PREFIX}/lib -L${DEVKITPRO}/libnx/lib' \
     --disable-runtime-cpudetect --disable-programs --disable-debug --disable-doc --disable-autodetect \
-    --disable-avdevice --disable-hwaccels --disable-encoders --disable-muxers \
+    --disable-avdevice --disable-encoders --disable-muxers \
     --enable-swscale --enable-swresample --enable-network  \
     --disable-protocols --enable-protocol=file,http,ftp,tcp,udp,rtmp \
-    --enable-zlib --enable-bzlib --enable-libass --enable-libfreetype --enable-libfribidi
+    --enable-zlib --enable-bzlib --enable-libass --enable-libfreetype --enable-libfribidi \
+    --enable-tx1
 
   make
 }
@@ -56,3 +54,6 @@ package() {
   # remove examples
   rm -r "$pkgdir"${PORTLIBS_PREFIX}/share
 }
+
+sha256sums=('57be87c22d9b49c112b6d24bc67d42508660e6b718b3db89c44e47e289137082'
+            'f234a671ce3dd1c7a3e3ed8bb035fbf1d5338146329ae411ad19ef139b7cf919')
