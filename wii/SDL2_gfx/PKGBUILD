@@ -3,7 +3,7 @@
 
 pkgname=wii-sdl2_gfx
 pkgver=1.0.4
-pkgrel=1
+pkgrel=2
 pkgdesc="SDL2 graphics drawing primitives."
 arch=('any')
 url="https://libsdl.org"
@@ -13,7 +13,7 @@ makedepends=('switch-pkg-config' 'dkp-toolchain-vars')
 depends=('switch-sdl2')
 source=("http://www.ferzkopp.net/Software/SDL2_gfx/SDL2_gfx-1.0.4.tar.gz")
 
-groups=('wii-portlibs' 'wii-sdl2')
+groups=('wii-portlibs' 'wii-sdl2-libs')
 
 build() {
 

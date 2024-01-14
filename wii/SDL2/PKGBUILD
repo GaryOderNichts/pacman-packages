@@ -11,7 +11,7 @@ options=(!strip libtool staticlibs)
 makedepends=('wii-pkg-config' 'dkp-toolchain-vars')
 depends=('libogc')
 source=("${url}/release/SDL2-${pkgver}.tar.gz" "SDL2-${pkgver}.patch")
-groups=('wii-portlibs' 'wii-sdl2')
+groups=('wii-portlibs' 'wii-sdl2-libs')
 
 build() {
   cd SDL2-$pkgver

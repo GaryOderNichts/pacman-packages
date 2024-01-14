@@ -4,7 +4,7 @@
 
 pkgname=wii-sdl2_ttf
 pkgver=2.0.15
-pkgrel=2
+pkgrel=3
 pkgdesc="SDL2 TrueType font library."
 arch=('any')
 url="https://libsdl.org/projects/SDL_ttf/"
@@ -17,7 +17,7 @@ depends=(
 )
 source=("${url}release/SDL2_ttf-${pkgver}.tar.gz")
 sha256sums=('a9eceb1ad88c1f1545cd7bd28e7cbc0b2c14191d40238f531a15b01b1b22cd33')
-groups=('wii-portlibs' 'wii-sdl2')
+groups=('wii-portlibs' 'wii-sdl2-libs')
 
 build() {
   cd SDL2_ttf-$pkgver
