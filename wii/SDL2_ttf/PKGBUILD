@@ -4,8 +4,8 @@
 
 pkgname=wii-sdl2_ttf
 pkgver=2.0.15
-pkgrel=1
-pkgdesc="SDL2 TrueType font library (Nintendo Switch port)."
+pkgrel=2
+pkgdesc="SDL2 TrueType font library."
 arch=('any')
 url="https://libsdl.org/projects/SDL_ttf/"
 license=("zlib")
