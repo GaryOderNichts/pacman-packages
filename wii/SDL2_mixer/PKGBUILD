@@ -1,0 +1,55 @@
+# Maintainer:  Dave Murphy <davem@devkitpro.org>
+# Contributor: Cpasjuste <cpasjuste@gmail.com>
+# Contributor: carstene1ns <dev f4ke de>
+
+pkgname=switch-sdl2_mixer
+pkgver=2.0.4
+pkgrel=2
+pkgdesc="A sample multi-channel audio mixer library."
+arch=('any')
+url="https://libsdl.org/projects/SDL_mixer/"
+license=("zlib")
+options=(!strip libtool staticlibs)
+makedepends=('switch-pkg-config' 'dkp-toolchain-vars')
+depends=(
+  'wii-sdl2'
+  'ppc-flac'
+  'ppc-libvorbisidec'
+  'ppc-libmodplug'
+  'ppc-mpg123'
+  'ppc-opusfile'
+)
+source=("${url}release/SDL2_mixer-${pkgver}.tar.gz")
+sha256sums=('b4cf5a382c061cd75081cf246c2aa2f9df8db04bdda8dcdc6b6cca55bede2419')
+groups=('wii-portlibs' 'wii-sdl2')
+
+build() {
+  cd SDL2_mixer-$pkgver
+
+  source ${DEVKITPRO}/wiivars.sh
+
+  # patch out compiling playwave and playmus
+  sed 's|\$(objects)/play.*mus\$(EXE)||' -i Makefile.in
+
+  LIBS="-lm" ./configure --prefix="${PORTLIBS_PREFIX}" \
+    --host=powerpc-eabi --disable-shared --enable-static \
+    --disable-music-cmd \
+    --enable-music-ogg-tremor \
+    --enable-music-mod-modplug
+
+  make
+}
+
+package() {
+  cd SDL2_mixer-$pkgver
+
+  source /opt/devkitpro/wiivars.sh
+
+  make DESTDIR="$pkgdir" install
+
+  # add our static libs
+  echo "Requires.private: vorbisidec libmodplug libmpg123 opusfile" >> "${pkgdir}/${PORTLIBS_PREFIX}/lib/pkgconfig/SDL2_mixer.pc"
+
+  # License
+  #install -Dm644 "COPYING.txt" "${pkgdir}/${PORTLIBS_PREFIX}/licenses/${pkgname}/COPYING.txt"
+}
