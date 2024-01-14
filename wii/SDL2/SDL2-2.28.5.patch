@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b38a8bbc1..c6552832e 100644
+index b38a8bbc1..e6834c350 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -141,6 +141,7 @@ check_cpu_architecture(x64 SDL_CPU_X64)
@@ -37,7 +37,7 @@ index b38a8bbc1..c6552832e 100644
        set(CMAKE_REQUIRED_FLAGS "-maltivec")
        check_c_source_compiles("
            #include <altivec.h>
-@@ -2883,6 +2884,62 @@ elseif(N3DS)
+@@ -2883,6 +2884,64 @@ elseif(N3DS)
      endif()
      list(APPEND EXTRA_LIBS ${lib})
    endforeach()
@@ -88,8 +88,10 @@ index b38a8bbc1..c6552832e 100644
 +
 +  if(SDL_VIDEO)
 +    set(SDL_VIDEO_DRIVER_OGC 1)
-+    file(GLOB OGC_VIDEO_SOURCES ${SDL2_SOURCE_DIR}/src/video/ogc/*.c)
++    set(SDL_VIDEO_RENDER_OGC 1)
++    file(GLOB OGC_VIDEO_SOURCES ${SDL2_SOURCE_DIR}/src/video/ogc/*.c ${SDL2_SOURCE_DIR}/src/render/ogc/*.c)
 +    list(APPEND SOURCE_FILES ${OGC_VIDEO_SOURCES})
++    set(SDL_VIDEO_OPENGL 0)
 +    set(HAVE_SDL_VIDEO TRUE)
 +  endif()
 +
@@ -155,7 +157,7 @@ index 000000000..a2a1fefb5
 +
 +-   Currently only software rendering is supported.
 diff --git a/include/SDL_config.h.cmake b/include/SDL_config.h.cmake
-index 35923d020..8d9cb5caf 100644
+index 35923d020..13f9a6022 100644
 --- a/include/SDL_config.h.cmake
 +++ b/include/SDL_config.h.cmake
 @@ -329,6 +329,7 @@
@@ -198,7 +200,15 @@ index 35923d020..8d9cb5caf 100644
  
  #cmakedefine SDL_VIDEO_RENDER_D3D @SDL_VIDEO_RENDER_D3D@
  #cmakedefine SDL_VIDEO_RENDER_D3D11 @SDL_VIDEO_RENDER_D3D11@
-@@ -514,6 +519,7 @@
+@@ -467,6 +472,7 @@
+ #cmakedefine SDL_VIDEO_RENDER_VITA_GXM @SDL_VIDEO_RENDER_VITA_GXM@
+ #cmakedefine SDL_VIDEO_RENDER_PS2 @SDL_VIDEO_RENDER_PS2@
+ #cmakedefine SDL_VIDEO_RENDER_PSP @SDL_VIDEO_RENDER_PSP@
++#cmakedefine SDL_VIDEO_RENDER_OGC @SDL_VIDEO_RENDER_OGC@
+ 
+ /* Enable OpenGL support */
+ #cmakedefine SDL_VIDEO_OPENGL @SDL_VIDEO_OPENGL@
+@@ -514,6 +520,7 @@
  #cmakedefine SDL_FILESYSTEM_PSP @SDL_FILESYSTEM_PSP@
  #cmakedefine SDL_FILESYSTEM_PS2 @SDL_FILESYSTEM_PS2@
  #cmakedefine SDL_FILESYSTEM_N3DS @SDL_FILESYSTEM_N3DS@
@@ -704,10 +714,10 @@ index a93fa662c..3d3329ae5 100644
  #ifdef __cplusplus
 diff --git a/src/joystick/ogc/SDL_sysjoystick.c b/src/joystick/ogc/SDL_sysjoystick.c
 new file mode 100644
-index 000000000..e97a5c686
+index 000000000..ab84b0f37
 --- /dev/null
 +++ b/src/joystick/ogc/SDL_sysjoystick.c
-@@ -0,0 +1,1246 @@
+@@ -0,0 +1,1313 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -737,6 +747,8 @@ index 000000000..e97a5c686
 +#include "../SDL_sysjoystick.h"
 +#include "../usb_ids.h"
 +#include "SDL_events.h"
++#include "SDL_hints.h"
++#include "../../SDL_hints_c.h"
 +#include "SDL_joystick.h"
 +
 +#include <gccore.h>
@@ -809,6 +821,7 @@ index 000000000..e97a5c686
 +typedef struct joystick_hwdata
 +{
 +    int index;
++    char sensors_disabled;
 +    /*  This must be big enough for MAX_RUMBLE */
 +    char rumble_intensity;
 +    u16 rumble_loop;
@@ -896,6 +909,7 @@ index 000000000..e97a5c686
 +static u32 s_gc_last_scanpads = 0;
 +#ifdef __wii__
 +static bool s_wii_has_new_data[MAX_WII_JOYSTICKS];
++static bool s_accelerometers_as_axes = false;
 +#endif
 +static bool s_hardware_queried = false;
 +
@@ -1004,6 +1018,13 @@ index 000000000..e97a5c686
 +    enable_rumble(joystick->hwdata->index, rumble);
 +}
 +
++static void SDLCALL
++on_hint_accel_as_joystick_cb(void *userdata, const char *name,
++                             const char *oldValue, const char *hint)
++{
++    s_accelerometers_as_axes = SDL_GetStringBoolean(hint, SDL_FALSE);
++}
++
 +/* Function to scan the system for joysticks.
 + * This function should return the number of available
 + * joysticks.  Joystick 0 should be the system default joystick.
@@ -1017,6 +1038,9 @@ index 000000000..e97a5c686
 +    PAD_Init();
 +    /* We don't call WPAD_Init() here, since it's already been called by
 +     * SDL_main for the Wii */
++
++    SDL_AddHintCallback(SDL_HINT_ACCELEROMETER_AS_JOYSTICK,
++                        on_hint_accel_as_joystick_cb, NULL);
 +
 +    /* Initialize the needed variables */
 +    for (int i = 0; i < MAX_JOYSTICKS; i++) {
@@ -1234,22 +1258,35 @@ index 000000000..e97a5c686
 +#ifdef __wii__
 +    } else {
 +        if (split_joysticks) {
-+            if (index < MAX_GC_JOYSTICKS + MAX_WII_JOYSTICKS) {
++            if (index < WII_WIIMOTES_END) {
 +                // wiimote
 +                joystick->nbuttons = SDL_WII_NUM_BUTTONS_WIIMOTE;
 +                joystick->naxes = 3;
 +                joystick->nhats = 1;
++                SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_ACCEL, 100.0f);
 +            } else {
 +                // expansion
 +                joystick->nbuttons = SDL_max(SDL_WII_NUM_BUTTONS_NUNCHUCK,
 +                                             SDL_WII_NUM_BUTTONS_CLASSIC);
 +                joystick->naxes = 6;
 +                joystick->nhats = 1;
++                if (s_detected_devices[index] == 1 + WPAD_EXP_NUNCHUK) {
++                    SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_ACCEL_L, 100.0f);
++                }
 +            }
 +        } else {
 +            joystick->nbuttons = MAX_WII_BUTTONS;
 +            joystick->naxes = MAX_WII_AXES;
 +            joystick->nhats = MAX_WII_HATS;
++            /* Add the accelerometer only if there is no expansion connected */
++            if (s_detected_devices[index] == 1) {
++                SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_ACCEL, 100.0f);
++            } else if (s_detected_devices[index] == 1 + WPAD_EXP_NUNCHUK) {
++                /* Or, if the nunchuck is connected, add the wiimote, and the
++                 * nunchuk on the left */
++                SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_ACCEL, 100.0f);
++                SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_ACCEL_L, 100.0f);
++            }
 +        }
 +#endif
 +    }
@@ -1322,6 +1359,11 @@ index 000000000..e97a5c686
 +
 +static int OGC_JoystickSetSensorsEnabled(SDL_Joystick *joystick, SDL_bool enabled)
 +{
++    int index = joystick->hwdata->index;
++    if (index >= WII_WIIMOTES_START && index < WII_WIIMOTES_END) {
++        joystick->hwdata->sensors_disabled = !enabled;
++        return 0;
++    }
 +    return SDL_Unsupported();
 +}
 +
@@ -1473,6 +1515,34 @@ index 000000000..e97a5c686
 +        SDL_PrivateJoystickAxis(joystick, start_index + 2, axis << 8);
 +        prev_state->wiimote.wiimote_yaw = axis;
 +    }
++}
++
++static void HandleNunchuckSensors(SDL_Joystick *joystick,
++                                  const nunchuk_t *data)
++{
++    float values[3];
++    SDL_SensorType type;
++
++    if (joystick->hwdata->sensors_disabled) return;
++
++    type = split_joysticks ? SDL_SENSOR_ACCEL : SDL_SENSOR_ACCEL_L;
++    values[0] = data->gforce.x * SDL_STANDARD_GRAVITY;
++    values[1] = data->gforce.z * SDL_STANDARD_GRAVITY;
++    values[2] = -data->gforce.y * SDL_STANDARD_GRAVITY;
++    SDL_PrivateJoystickSensor(joystick, type, 0, values, 3);
++}
++
++static void HandleWiimoteSensors(SDL_Joystick *joystick,
++                                 WPADData *data)
++{
++    float values[3];
++
++    if (joystick->hwdata->sensors_disabled) return;
++
++    values[0] = data->gforce.x * SDL_STANDARD_GRAVITY;
++    values[1] = data->gforce.z * SDL_STANDARD_GRAVITY;
++    values[2] = -data->gforce.y * SDL_STANDARD_GRAVITY;
++    SDL_PrivateJoystickSensor(joystick, SDL_SENSOR_ACCEL, 0, values, 3);
 +}
 +
 +static void _HandleWiiJoystickUpdate(SDL_Joystick *joystick)
@@ -1642,14 +1712,19 @@ index 000000000..e97a5c686
 +                SDL_PrivateJoystickAxis(joystick, 1, axis);
 +                prev_state->wiimote.nunchuk_stickY = axis;
 +            }
++
++            HandleNunchuckSensors(joystick, &data->exp.nunchuk);
 +        }
 +    }
 +
 +    prev_state->wiimote.exp = data->exp.type;
 +
 +    if (update_wiimote) {
-+        int start_index = split_joysticks ? 0 : 6;
-+        HandleWiiMotion(joystick, prev_state, data, start_index);
++        if (s_accelerometers_as_axes) {
++            int start_index = split_joysticks ? 0 : 6;
++            HandleWiiMotion(joystick, prev_state, data, start_index);
++        }
++        HandleWiimoteSensors(joystick, data);
 +    }
 +}
 +#endif /* __wii__ */
@@ -1753,6 +1828,8 @@ index 000000000..e97a5c686
 +
 +void OGC_JoystickQuit(void)
 +{
++    SDL_DelHintCallback(SDL_HINT_ACCELEROMETER_AS_JOYSTICK,
++                        on_hint_accel_as_joystick_cb, NULL);
 +}
 +
 +static SDL_bool OGC_JoystickGetGamepadMapping(int device_index,
@@ -2016,10 +2093,10 @@ index 000000000..f0d42bed9
 +/* vi: set sts=4 ts=4 sw=4 expandtab: */
 diff --git a/src/main/wii/SDL_wii_main.c b/src/main/wii/SDL_wii_main.c
 new file mode 100644
-index 000000000..f399aa762
+index 000000000..d25d7ee21
 --- /dev/null
 +++ b/src/main/wii/SDL_wii_main.c
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,91 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -2098,13 +2175,686 @@ index 000000000..f399aa762
 +    // TODO KEYBOARD_Init(NULL);
 +    fatInitDefault();
 +
-+    /* Call the user's main function */
++    /* Call the user's main function. Make sure that argv contains at least one
++     * element. */
++    if (!argv || argv[0] == NULL) {
++        static const char *dummy_argv[2] = { "app", NULL };
++        argc = 1;
++        argv = dummy_argv;
++    }
 +    return SDL_main(argc, argv);
 +}
 +
 +#endif /* __wii__ */
 +
 +/* vi: set sts=4 ts=4 sw=4 expandtab: */
+diff --git a/src/render/SDL_render.c b/src/render/SDL_render.c
+index b650c6ac4..dc7a5b0b2 100644
+--- a/src/render/SDL_render.c
++++ b/src/render/SDL_render.c
+@@ -124,6 +124,9 @@ static const SDL_RenderDriver *render_drivers[] = {
+ #if SDL_VIDEO_RENDER_VITA_GXM
+     &VITA_GXM_RenderDriver,
+ #endif
++#ifdef SDL_VIDEO_RENDER_OGC
++    &OGC_RenderDriver,
++#endif
+ #if SDL_VIDEO_RENDER_SW
+     &SW_RenderDriver
+ #endif
+diff --git a/src/render/SDL_sysrender.h b/src/render/SDL_sysrender.h
+index 36e9555bb..d3db2b387 100644
+--- a/src/render/SDL_sysrender.h
++++ b/src/render/SDL_sysrender.h
+@@ -307,6 +307,7 @@ extern SDL_RenderDriver PS2_RenderDriver;
+ extern SDL_RenderDriver PSP_RenderDriver;
+ extern SDL_RenderDriver SW_RenderDriver;
+ extern SDL_RenderDriver VITA_GXM_RenderDriver;
++extern SDL_RenderDriver OGC_RenderDriver;
+ 
+ /* Blend mode functions */
+ extern SDL_BlendFactor SDL_GetBlendModeSrcColorFactor(SDL_BlendMode blendMode);
+diff --git a/src/render/ogc/SDL_render_ogc.c b/src/render/ogc/SDL_render_ogc.c
+new file mode 100644
+index 000000000..96c8de160
+--- /dev/null
++++ b/src/render/ogc/SDL_render_ogc.c
+@@ -0,0 +1,635 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++#include "../../SDL_internal.h"
++
++#ifdef SDL_VIDEO_RENDER_OGC
++
++#include "../SDL_sysrender.h"
++#include "SDL_hints.h"
++
++#include "../../video/ogc/SDL_ogcgxcommon.h"
++#include "../../video/ogc/SDL_ogcpixels.h"
++#include "../../video/ogc/SDL_ogcvideo.h"
++
++#include <malloc.h>
++#include <ogc/cache.h>
++#include <ogc/gx.h>
++#include <ogc/video.h>
++
++#define MAX_EFB_WIDTH 640
++#define MAX_EFB_HEIGHT 528
++
++typedef struct
++{
++    SDL_BlendMode current_blend_mode;
++    GXColor clear_color;
++    int ops_after_present;
++    bool vsync;
++} OGC_RenderData;
++
++typedef struct
++{
++    void *texels;
++    void *pixels;
++    SDL_Rect pixels_rect;
++    u16 pitch;
++    u16 pixels_pitch;
++    u8 format;
++    u8 needed_stages; // Normally 1, set to 2 for palettized formats
++} OGC_TextureData;
++
++static void OGC_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *event)
++{
++}
++
++static inline void OGC_SetBlendMode(SDL_Renderer *renderer, SDL_BlendMode blend_mode)
++{
++    OGC_RenderData *data = renderer->driverdata;
++
++    if (blend_mode == data->current_blend_mode) {
++        /* Nothing to do */
++        return;
++    }
++
++    switch (blend_mode) {
++    case SDL_BLENDMODE_NONE:
++        GX_SetBlendMode(GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
++        break;
++    case SDL_BLENDMODE_BLEND:
++        GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
++        break;
++    case SDL_BLENDMODE_ADD:
++        GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE, GX_LO_CLEAR);
++        break;
++    case SDL_BLENDMODE_MOD:
++        GX_SetBlendMode(GX_BM_BLEND, GX_BL_DSTCLR, GX_BL_ZERO, GX_LO_CLEAR);
++        break;
++    case SDL_BLENDMODE_MUL:
++        GX_SetBlendMode(GX_BM_BLEND, GX_BL_DSTCLR, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
++        break;
++    default:
++        return;
++    }
++
++    data->current_blend_mode = blend_mode;
++}
++
++static void save_efb_to_texture(SDL_Renderer *renderer)
++{
++    SDL_Texture *texture = renderer->target;
++    OGC_TextureData *ogc_tex = texture->driverdata;
++
++    GX_SetTexCopySrc(0, 0, texture->w, texture->h);
++    GX_SetTexCopyDst(texture->w, texture->h, ogc_tex->format, GX_FALSE);
++    GX_CopyTex(ogc_tex->texels, GX_TRUE);
++}
++
++static int OGC_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture)
++{
++    u32 texture_size;
++    OGC_TextureData *ogc_tex;
++
++    ogc_tex = SDL_calloc(1, sizeof(OGC_TextureData));
++    if (!ogc_tex) {
++        return SDL_OutOfMemory();
++    }
++
++    ogc_tex->format = OGC_texture_format_from_SDL(texture->format);
++    ogc_tex->needed_stages = (ogc_tex->format == GX_TF_CI8) ? 2 : 1;
++    texture_size = GX_GetTexBufferSize(texture->w, texture->h, ogc_tex->format,
++                                       GX_FALSE, 0);
++    ogc_tex->texels = memalign(32, texture_size);
++    if (!ogc_tex->texels) {
++        SDL_free(ogc_tex);
++        return SDL_OutOfMemory();
++    }
++
++    texture->driverdata = ogc_tex;
++    return 0;
++}
++
++static int OGC_LockTexture(SDL_Renderer *renderer, SDL_Texture *texture,
++                           const SDL_Rect *rect, void **pixels, int *pitch)
++{
++    OGC_TextureData *ogc_tex = texture->driverdata;
++
++    ogc_tex->pixels = SDL_malloc(rect->w * rect->h * SDL_BYTESPERPIXEL(texture->format));
++    ogc_tex->pixels_pitch = rect->w * SDL_BYTESPERPIXEL(texture->format);
++    ogc_tex->pixels_rect = *rect;
++    *pixels = ogc_tex->pixels;
++    *pitch = ogc_tex->pixels_pitch;
++    return 0;
++}
++
++static void OGC_UnlockTexture(SDL_Renderer *renderer, SDL_Texture *texture)
++{
++    OGC_TextureData *ogc_tex = texture->driverdata;
++    u32 texture_size;
++
++    OGC_pixels_to_texture(ogc_tex->pixels, texture->format,
++                          &ogc_tex->pixels_rect, ogc_tex->pixels_pitch,
++                          ogc_tex->texels, texture->w);
++    /* It would be more effective if we updated only the changed range here,
++     * but the complexity is probably not worth the effort. */
++    texture_size = GX_GetTexBufferSize(texture->w, texture->h, ogc_tex->format,
++                                       GX_FALSE, 0);
++    DCStoreRange(ogc_tex->texels, texture_size);
++    GX_InvalidateTexAll();
++
++
++    if (ogc_tex->pixels) {
++        SDL_free(ogc_tex->pixels);
++        ogc_tex->pixels = NULL;
++    }
++}
++
++static int OGC_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
++                             const SDL_Rect *rect, const void *pixels, int pitch)
++{
++    OGC_TextureData *ogc_tex = texture->driverdata;
++
++    OGC_pixels_to_texture((void*)pixels, texture->format, rect,
++                          pitch, ogc_tex->texels, texture->w);
++
++    return 0;
++}
++
++static void OGC_SetTextureScaleMode(SDL_Renderer *renderer,
++                                    SDL_Texture *texture,
++                                    SDL_ScaleMode scaleMode)
++{
++    /* Nothing to do here: the scale mode is applied to the texture when
++     * loading it in OGC_load_texture(). */
++}
++
++static int OGC_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
++{
++    OGC_RenderData *data = renderer->driverdata;
++
++    if (texture) {
++        if (texture->w > MAX_EFB_WIDTH || texture->h > MAX_EFB_HEIGHT) {
++            return SDL_SetError("Render target bigger than EFB");
++        }
++
++        if (data->ops_after_present > 0) {
++            /* We should save the current EFB contents into the window data.
++             * However, it's unclear whether this is a possible scenario, since
++             * all actual drawing happens in RunCommandQueue() and this method
++             * will not be called in between of the drawing operations; but
++             * just to be on the safe side, log a warning. We can come back to
++             * this later and implement the EFB saving if we see that this
++             * happens in real life.
++             */
++            SDL_LogWarn(SDL_LOG_CATEGORY_RENDER,
++                        "Render target set after drawing!");
++        }
++    }
++    return 0;
++}
++
++static int OGC_QueueSetViewport(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
++{
++    return 0; /* nothing to do in this backend. */
++}
++
++static int OGC_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
++                               const SDL_FPoint *points, int count)
++{
++    size_t size = count * sizeof(SDL_FPoint);
++    SDL_FPoint *vertices = SDL_AllocateRenderVertices(renderer, size,
++                                                      4, &cmd->data.draw.first);
++    if (!vertices) {
++        return -1;
++    }
++
++    cmd->data.draw.count = count;
++    SDL_memcpy(vertices, points, size);
++    return 0;
++}
++
++static int OGC_QueueFillRects(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
++                               const SDL_FRect *rects, int count)
++{
++    size_t size = count * sizeof(SDL_FPoint) * 4;
++    SDL_FPoint *vertices = SDL_AllocateRenderVertices(renderer, size,
++                                                      4, &cmd->data.draw.first);
++    if (!vertices) {
++        return -1;
++    }
++
++    cmd->data.draw.count = count;
++    for (int i = 0; i < count; i++) {
++        vertices[i].x = rects[i].x;
++        vertices[i].y = rects[i].y;
++        vertices[i+1].x = rects[i].x + rects[i].w;
++        vertices[i+1].y = rects[i].y;
++        vertices[i+2].x = rects[i].x + rects[i].w;
++        vertices[i+2].y = rects[i].y + rects[i].h;
++        vertices[i+3].x = rects[i].x;
++        vertices[i+3].y = rects[i].y + rects[i].h;
++    }
++    return 0;
++}
++
++static int OGC_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL_Texture *texture,
++                             const float *xy, int xy_stride, const SDL_Color *color, int color_stride,
++                             const float *uv, int uv_stride,
++                             int num_vertices, const void *indices, int num_indices, int size_indices,
++                             float scale_x, float scale_y)
++{
++    int i;
++    int count = indices ? num_indices : num_vertices;
++    size_t size_per_element;
++    char *vertices;
++
++    cmd->data.draw.count = count;
++    size_indices = indices ? size_indices : 0;
++
++    size_per_element = sizeof(SDL_FPoint) + sizeof(SDL_Color);
++    if (texture) {
++        size_per_element += sizeof(SDL_FPoint);
++    }
++
++    vertices = SDL_AllocateRenderVertices(renderer, count * size_per_element,
++                                          4, &cmd->data.draw.first);
++    if (!vertices) {
++        return -1;
++    }
++
++    for (i = 0; i < count; i++) {
++        int j;
++        float *xy_;
++        float *uv_;
++        SDL_Color col;
++        char *vertex;
++        SDL_FPoint *vertex_xy;
++        if (size_indices == 4) {
++            j = ((const Uint32 *)indices)[i];
++        } else if (size_indices == 2) {
++            j = ((const Uint16 *)indices)[i];
++        } else if (size_indices == 1) {
++            j = ((const Uint8 *)indices)[i];
++        } else {
++            j = i;
++        }
++
++        xy_ = (float *)((char *)xy + j * xy_stride);
++        col = *(SDL_Color *)((char *)color + j * color_stride);
++        uv_ = (float *)((char *)uv + j * uv_stride);
++
++        vertex = vertices + size_per_element * i;
++
++        vertex_xy = (SDL_FPoint *)vertex;
++        vertex_xy->x = xy_[0];
++        vertex_xy->y = xy_[1];
++
++        *(SDL_Color *)(vertex + sizeof(SDL_FPoint)) = col;
++
++        if (texture) {
++            SDL_FPoint *vertex_uv = (SDL_FPoint *)(vertex + sizeof(SDL_FPoint) + sizeof(SDL_Color));
++            vertex_uv->x = uv_[0];
++            vertex_uv->y = uv_[1];
++        }
++    }
++
++    return 0;
++}
++
++static int OGC_RenderSetViewPort(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
++{
++    const SDL_Rect *viewport = &cmd->data.viewport.rect;
++
++    float v_aspect = viewport->h / 2.0;
++    float h_aspect = viewport->w / 2.0;
++    OGC_set_viewport(viewport->x, viewport->y, viewport->w, viewport->h,
++                     h_aspect, v_aspect);
++    return 0;
++}
++
++static int OGC_RenderSetClipRect(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
++{
++    const SDL_Rect *rect = &cmd->data.cliprect.rect;
++
++    if (cmd->data.cliprect.enabled) {
++        GX_SetScissor(renderer->viewport.x + rect->x,
++                      renderer->viewport.y + rect->y,
++                      rect->w, rect->h);
++        GX_SetClipMode(GX_CLIP_ENABLE);
++    } else {
++        GX_SetClipMode(GX_CLIP_DISABLE);
++    }
++
++    return 0;
++}
++
++static int OGC_RenderClear(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
++{
++    OGC_RenderData *data = renderer->driverdata;
++
++    GXColor c = {
++        cmd->data.color.r,
++        cmd->data.color.g,
++        cmd->data.color.b,
++        cmd->data.color.a
++    };
++
++    /* If nothing has been drawn after Present, and if the clear color has not
++     * changed, there's no need to do anything here. */
++    if (data->ops_after_present == 0 &&
++        GX_COLOR_AS_U32(c) == GX_COLOR_AS_U32(data->clear_color)) {
++        return 0;
++    }
++
++    data->clear_color = c;
++    GX_SetCopyClear(c, GX_MAX_Z24);
++    GX_CopyDisp(OGC_video_get_xfb(SDL_GetVideoDevice()), GX_TRUE);
++
++    return 0;
++}
++
++static int OGC_RenderGeometry(SDL_Renderer *renderer, void *vertices,
++                              SDL_RenderCommand *cmd)
++{
++    OGC_RenderData *data = renderer->driverdata;
++    const size_t count = cmd->data.draw.count;
++    SDL_Texture *texture = cmd->data.draw.texture;
++    size_t size_per_element;
++
++    data->ops_after_present++;
++    OGC_SetBlendMode(renderer, cmd->data.draw.blend);
++
++    size_per_element = sizeof(SDL_FPoint) + sizeof(SDL_Color);
++
++    GX_ClearVtxDesc();
++    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
++    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
++    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
++    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
++    if (texture) {
++        OGC_TextureData *ogc_tex = texture->driverdata;
++        u8 stage;
++
++        size_per_element += sizeof(SDL_FPoint);
++        OGC_load_texture(ogc_tex->texels, texture->w, texture->h,
++                         ogc_tex->format, texture->scaleMode);
++        stage = GX_TEVSTAGE0 + ogc_tex->needed_stages - 1;
++
++        GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
++        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
++        GX_SetNumTexGens(1);
++
++        GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
++        GX_SetTevOrder(stage, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
++        GX_SetTevOp(stage, GX_MODULATE);
++        GX_SetNumTevStages(stage - GX_TEVSTAGE0 + 1);
++    } else {
++        GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
++    }
++
++    GX_Begin(GX_TRIANGLES, GX_VTXFMT0, count);
++    for (int i = 0; i < count; i++) {
++        void *vertex = vertices + cmd->data.draw.first + size_per_element * i;
++        SDL_FPoint *vertex_xy = vertex;
++        SDL_Color *c = (SDL_Color*)(vertex + sizeof(SDL_FPoint));
++
++        GX_Position2f32(vertex_xy->x, vertex_xy->y);
++        GX_Color4u8(c->r, c->g, c->b, c->a);
++        if (texture) {
++            SDL_FPoint *vertex_uv = (SDL_FPoint *)(vertex + sizeof(SDL_FPoint) + sizeof(SDL_Color));
++            GX_TexCoord2f32(vertex_uv->x, vertex_uv->y);
++        }
++    }
++    GX_End();
++    return 0;
++}
++
++int OGC_RenderPrimitive(SDL_Renderer *renderer, u8 primitive,
++                        void *vertices, SDL_RenderCommand *cmd)
++{
++    OGC_RenderData *data = renderer->driverdata;
++    size_t count = cmd->data.draw.count;
++    const SDL_FPoint *verts = (SDL_FPoint *)(vertices + cmd->data.draw.first);
++    GXColor c = {
++        cmd->data.draw.r,
++        cmd->data.draw.g,
++        cmd->data.draw.b,
++        cmd->data.draw.a
++    };
++
++    data->ops_after_present++;
++    OGC_SetBlendMode(renderer, cmd->data.draw.blend);
++
++    /* TODO: optimize state changes. */
++    GX_SetTevColor(GX_TEVREG0, c);
++    GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_C0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO);
++    GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_A0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO);
++    GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
++    GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
++
++    GX_ClearVtxDesc();
++    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
++    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
++
++    if (primitive == GX_QUADS) count *= 4;
++
++    GX_Begin(primitive, GX_VTXFMT0, count);
++    for (int i = 0; i < count; i++) {
++        GX_Position2f32(verts[i].x, verts[i].y);
++    }
++    GX_End();
++
++    /* The last point is not drawn */
++    if (primitive == GX_LINESTRIP) {
++        GX_Begin(GX_POINTS, GX_VTXFMT0, 1);
++        GX_Position2f32(verts[count - 1].x, verts[count - 1].y);
++        GX_End();
++    }
++
++    return 0;
++}
++
++static int OGC_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
++{
++    while (cmd) {
++        switch (cmd->command) {
++        case SDL_RENDERCMD_SETVIEWPORT:
++            OGC_RenderSetViewPort(renderer, cmd);
++            break;
++        case SDL_RENDERCMD_SETCLIPRECT:
++            OGC_RenderSetClipRect(renderer, cmd);
++            break;
++        case SDL_RENDERCMD_SETDRAWCOLOR:
++            /* This is a no-op, since every command carries the color, and
++             * setting it on the FIFO is not expensive. */
++            break;
++        case SDL_RENDERCMD_CLEAR:
++            OGC_RenderClear(renderer, cmd);
++            break;
++        case SDL_RENDERCMD_DRAW_POINTS:
++            OGC_RenderPrimitive(renderer, GX_POINTS, vertices, cmd);
++            break;
++        case SDL_RENDERCMD_DRAW_LINES:
++            OGC_RenderPrimitive(renderer, GX_LINESTRIP, vertices, cmd);
++            break;
++        case SDL_RENDERCMD_FILL_RECTS:
++            OGC_RenderPrimitive(renderer, GX_QUADS, vertices, cmd);
++            break;
++        case SDL_RENDERCMD_COPY: /* unused */
++            break;
++        case SDL_RENDERCMD_COPY_EX: /* unused */
++            break;
++        case SDL_RENDERCMD_GEOMETRY:
++            OGC_RenderGeometry(renderer, vertices, cmd);
++            break;
++        case SDL_RENDERCMD_NO_OP:
++            break;
++        }
++        cmd = cmd->next;
++    }
++
++    if (renderer->target) {
++        save_efb_to_texture(renderer);
++    }
++
++    return 0;
++}
++
++static int OGC_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
++                                Uint32 format, void *pixels, int pitch)
++{
++    return SDL_Unsupported();
++}
++
++static int OGC_RenderPresent(SDL_Renderer *renderer)
++{
++    OGC_RenderData *data = renderer->driverdata;
++
++    GX_DrawDone();
++
++    OGC_video_flip(SDL_GetVideoDevice(), data->vsync);
++
++    data->ops_after_present = 0;
++    return 0;
++}
++
++static void OGC_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture)
++{
++    OGC_TextureData *ogc_tex = texture->driverdata;
++
++    if (ogc_tex) {
++        free(ogc_tex->texels);
++        SDL_free(ogc_tex);
++        texture->driverdata = NULL;
++    }
++}
++
++static void OGC_DestroyRenderer(SDL_Renderer *renderer)
++{
++    OGC_RenderData *data = renderer->driverdata;
++
++    if (data) {
++        SDL_free(data);
++    }
++
++    SDL_free(renderer);
++}
++
++static int OGC_SetVSync(SDL_Renderer *renderer, const int vsync)
++{
++    OGC_RenderData *data = (OGC_RenderData *)renderer->driverdata;
++    data->vsync = vsync ? 1 : 0;
++    return 0;
++}
++
++static SDL_Renderer *OGC_CreateRenderer(SDL_Window *window, Uint32 flags)
++{
++    SDL_Renderer *renderer;
++    OGC_RenderData *data;
++
++    renderer = (SDL_Renderer *)SDL_calloc(1, sizeof(*renderer));
++    if (!renderer) {
++        SDL_OutOfMemory();
++        return NULL;
++    }
++
++    data = (OGC_RenderData *)SDL_calloc(1, sizeof(*data));
++    if (!data) {
++        OGC_DestroyRenderer(renderer);
++        SDL_OutOfMemory();
++        return NULL;
++    }
++
++    data->current_blend_mode = SDL_BLENDMODE_NONE;
++    data->vsync = true;
++
++    renderer->WindowEvent = OGC_WindowEvent;
++    renderer->CreateTexture = OGC_CreateTexture;
++    renderer->UpdateTexture = OGC_UpdateTexture;
++    renderer->LockTexture = OGC_LockTexture;
++    renderer->UnlockTexture = OGC_UnlockTexture;
++    renderer->SetTextureScaleMode = OGC_SetTextureScaleMode;
++    renderer->SetRenderTarget = OGC_SetRenderTarget;
++    renderer->QueueSetViewport = OGC_QueueSetViewport;
++    renderer->QueueSetDrawColor = OGC_QueueSetViewport;
++    renderer->QueueDrawPoints = OGC_QueueDrawPoints;
++    renderer->QueueDrawLines = OGC_QueueDrawPoints;
++    renderer->QueueFillRects = OGC_QueueFillRects;
++    renderer->QueueGeometry = OGC_QueueGeometry;
++    renderer->RunCommandQueue = OGC_RunCommandQueue;
++    renderer->RenderReadPixels = OGC_RenderReadPixels;
++    renderer->RenderPresent = OGC_RenderPresent;
++    renderer->DestroyTexture = OGC_DestroyTexture;
++    renderer->DestroyRenderer = OGC_DestroyRenderer;
++    renderer->SetVSync = OGC_SetVSync;
++    renderer->info = OGC_RenderDriver.info;
++    renderer->driverdata = data;
++    renderer->window = window;
++
++    if (!SDL_GetHint(SDL_HINT_RENDER_LINE_METHOD)) {
++        /* SDL sets the default one to point drawing, but we prefer lines */
++        SDL_SetHint(SDL_HINT_RENDER_LINE_METHOD, "2");
++    }
++
++    return renderer;
++}
++
++SDL_RenderDriver OGC_RenderDriver = {
++    .CreateRenderer = OGC_CreateRenderer,
++    .info = {
++        .name = "ogc",
++        .flags = SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE,
++        .num_texture_formats = 5,
++        .texture_formats = {
++            [0] = SDL_PIXELFORMAT_RGB565,
++            [1] = SDL_PIXELFORMAT_RGBA8888,
++            [2] = SDL_PIXELFORMAT_ARGB8888,
++            [3] = SDL_PIXELFORMAT_RGB24,
++            [4] = SDL_PIXELFORMAT_XRGB8888,
++            // TODO: add more
++        },
++        .max_texture_width = 1024,
++        .max_texture_height = 1024,
++    }
++};
++
++#endif /* SDL_VIDEO_RENDER_OGC */
++
++/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/thread/SDL_thread_c.h b/src/thread/SDL_thread_c.h
 index 278a68026..f2791f1ff 100644
 --- a/src/thread/SDL_thread_c.h
@@ -2776,10 +3526,10 @@ index 8065a0b8c..e5412450c 100644
  #endif
 diff --git a/src/video/ogc/SDL_ogcevents.c b/src/video/ogc/SDL_ogcevents.c
 new file mode 100644
-index 000000000..7540bc960
+index 000000000..9451576f9
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcevents.c
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,100 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -2804,8 +3554,7 @@ index 000000000..7540bc960
 +
 +#ifdef SDL_VIDEO_DRIVER_OGC
 +
-+/* Being a null driver, there's no event stream. We just define stubs for
-+   most of the API. */
++#include "SDL.h"
 +
 +#include "../../events/SDL_events_c.h"
 +
@@ -2813,10 +3562,54 @@ index 000000000..7540bc960
 +#include "SDL_ogcvideo.h"
 +
 +#include <ogc/system.h>
++#include <wiiuse/wpad.h>
 +
 +/* These variables can be set from the handlers registered in SDL_main() */
 +bool OGC_PowerOffRequested = false;
 +bool OGC_ResetRequested = false;
++
++#ifdef __wii__
++#define MAX_WII_MOUSE_BUTTONS 2
++static const struct {
++    int wii;
++    int mouse;
++} s_mouse_button_map[MAX_WII_MOUSE_BUTTONS] = {
++    { WPAD_BUTTON_B, SDL_BUTTON_LEFT },
++    { WPAD_BUTTON_A, SDL_BUTTON_RIGHT },
++};
++
++static void pump_ir_events(_THIS)
++{
++    if (!_this->windows) return;
++
++    if (!SDL_WasInit(SDL_INIT_JOYSTICK)) {
++        /* Get events from WPAD; we don't need to do this if the joystick
++         * system was initialized, because in that case this operation is done
++         * there at every event loop iteration. */
++        WPAD_ReadPending(WPAD_CHAN_ALL, NULL);
++    }
++
++    for (int i = 0; i < 4; i++) {
++        WPADData *data = WPAD_Data(i);
++
++        if (!data->ir.smooth_valid) continue;
++
++        SDL_SendMouseMotion(_this->windows, i,
++                            0, data->ir.sx, data->ir.sy);
++
++        for (int b = 0; b < MAX_WII_MOUSE_BUTTONS; b++) {
++            if (data->btns_d & s_mouse_button_map[b].wii) {
++                SDL_SendMouseButton(_this->windows, i,
++                                    SDL_PRESSED, s_mouse_button_map[b].mouse);
++            }
++            if (data->btns_u & s_mouse_button_map[b].wii) {
++                SDL_SendMouseButton(_this->windows, i,
++                                    SDL_RELEASED, s_mouse_button_map[b].mouse);
++            }
++        }
++    }
++}
++#endif
 +
 +void OGC_PumpEvents(_THIS)
 +{
@@ -2828,6 +3621,10 @@ index 000000000..7540bc960
 +            SYS_ResetSystem(SYS_POWEROFF, 0, 0);
 +        }
 +    }
++
++#ifdef __wii__
++    pump_ir_events(_this);
++#endif
 +}
 +
 +#endif /* SDL_VIDEO_DRIVER_OGC */
@@ -2877,10 +3674,10 @@ index 000000000..6bc6b91e6
 +/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/video/ogc/SDL_ogcframebuffer.c b/src/video/ogc/SDL_ogcframebuffer.c
 new file mode 100644
-index 000000000..0c53c1452
+index 000000000..21fb7ee0c
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcframebuffer.c
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,129 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -2908,6 +3705,7 @@ index 000000000..0c53c1452
 +#include "../SDL_sysvideo.h"
 +#include "SDL_ogcframebuffer_c.h"
 +#include "SDL_ogcgxcommon.h"
++#include "SDL_ogcpixels.h"
 +#include "SDL_ogcvideo.h"
 +
 +#include <malloc.h>
@@ -2977,23 +3775,25 @@ index 000000000..0c53c1452
 +
 +int SDL_OGC_UpdateWindowFramebuffer(_THIS, SDL_Window *window, const SDL_Rect *rects, int numrects)
 +{
-+    SDL_VideoData *videodata = (SDL_VideoData *)_this->driverdata;
 +    SDL_WindowData *windowdata = (SDL_WindowData *)window->driverdata;
++    u32 texture_size;
 +    u8 gx_format;
 +
-+    OGC_prepare_texels(windowdata->pixels, window->w, window->h, window->surface->pitch,
-+                       windowdata->surface_format,
-+                       windowdata->texels, &gx_format);
-+    OGC_load_texture(windowdata->texels, window->w, window->h, gx_format);
++    gx_format = OGC_texture_format_from_SDL(windowdata->surface_format);
++    for (int i = 0; i < numrects; i++) {
++        OGC_pixels_to_texture(windowdata->pixels, windowdata->surface_format, &rects[i],
++                              window->surface->pitch, windowdata->texels, window->w);
++    }
++    texture_size = GX_GetTexBufferSize(window->w, window->h, gx_format,
++                                       GX_FALSE, 0);
++    DCStoreRange(windowdata->texels, texture_size);
++    GX_InvalidateTexAll();
++    OGC_load_texture(windowdata->texels, window->w, window->h, gx_format,
++                     SDL_ScaleModeNearest);
 +    draw_screen_rect(window);
 +    GX_DrawDone();
 +
-+    GX_CopyDisp(videodata->xfb[0], GX_TRUE);
-+    GX_DrawDone();
-+    GX_Flush();
-+
-+    VIDEO_Flush();
-+    VIDEO_WaitVSync();
++    OGC_video_flip(_this, true);
 +
 +    return 0;
 +}
@@ -3048,10 +3848,10 @@ index 000000000..af58bbcc1
 +/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/video/ogc/SDL_ogcgxcommon.c b/src/video/ogc/SDL_ogcgxcommon.c
 new file mode 100644
-index 000000000..787e6ccc1
+index 000000000..eeb1146ad
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcgxcommon.c
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,149 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -3106,11 +3906,28 @@ index 000000000..787e6ccc1
 +    1.0,
 +};
 +
-+void OGC_draw_init(int w, int h, int h_aspect, int v_aspect)
++void OGC_set_viewport(int x, int y, int w, int h, float h_aspect, float v_aspect)
 +{
 +    Mtx m, mv, view;
 +    Mtx44 proj;
 +
++    GX_SetViewport(x, y, w, h, 0, 1);
++    GX_SetScissor(x, y, w, h);
++
++    memset(&view, 0, sizeof(Mtx));
++    guLookAt(view, &cam.pos, &cam.up, &cam.view);
++    guMtxIdentity(m);
++    guMtxTransApply(m, m, 0.5 + (-w / 2.0), 0.5 + (-h / 2.0), 1000);
++    guMtxConcat(view, m, mv);
++    GX_LoadPosMtxImm(mv, GX_PNMTX0);
++
++    // matrix, t, b, l, r, n, f
++    guOrtho(proj, v_aspect, -v_aspect, -h_aspect, h_aspect, 100, 1000);
++    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
++}
++
++void OGC_draw_init(int w, int h, int h_aspect, int v_aspect)
++{
 +    SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "OGC_draw_init called with %d, %d", w, h);
 +
 +    GX_ClearVtxDesc();
@@ -3131,33 +3948,13 @@ index 000000000..787e6ccc1
 +    GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
 +    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
 +
-+    memset(&view, 0, sizeof(Mtx));
-+    guLookAt(view, &cam.pos, &cam.up, &cam.view);
-+    guMtxIdentity(m);
-+    guMtxTransApply(m, m, -w / 2, -h / 2, 1000);
-+    guMtxConcat(view, m, mv);
-+    GX_LoadPosMtxImm(mv, GX_PNMTX0);
-+
-+    // matrix, t, b, l, r, n, f
-+    guOrtho(proj, v_aspect, -v_aspect, -h_aspect, h_aspect, 100, 1000);
-+    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
++    OGC_set_viewport(0, 0, w, h, h_aspect, v_aspect);
 +
 +    GX_InvVtxCache(); // update vertex cache
 +}
 +
-+void OGC_prepare_texels(void *pixels, int w, int h, int pitch, Uint32 format,
-+                        void *texels, u8 *gx_format)
-+{
-+    u32 texture_size;
-+
-+    OGC_pixels_to_texture(pixels, format, w, h, pitch,
-+                          texels, gx_format);
-+    texture_size = GX_GetTexBufferSize(w, h, *gx_format, GX_FALSE, 0);
-+    DCStoreRange(texels, texture_size);
-+    GX_InvalidateTexAll();
-+}
-+
-+void OGC_load_texture(void *texels, int w, int h, u8 format)
++void OGC_load_texture(void *texels, int w, int h, u8 format,
++                      SDL_ScaleMode scale_mode)
 +{
 +    GXTexObj texobj_a, texobj_b;
 +
@@ -3185,7 +3982,19 @@ index 000000000..787e6ccc1
 +        GX_InitTexObj(&texobj_a, texels, w, h, format, GX_CLAMP, GX_CLAMP, GX_FALSE);
 +    }
 +
-+    GX_InitTexObjLOD(&texobj_a, GX_NEAR, GX_NEAR, 0.0f, 0.0f, 0.0f, 0, 0, GX_ANISO_1);
++    switch (scale_mode) {
++    case SDL_ScaleModeLinear:
++        GX_InitTexObjLOD(&texobj_a, GX_LINEAR, GX_LINEAR,
++                         0.0f, 0.0f, 0.0f, 0, 0, GX_ANISO_1);
++        break;
++    case SDL_ScaleModeBest:
++        GX_InitTexObjLOD(&texobj_a, GX_LIN_MIP_LIN, GX_LINEAR,
++                         0.0f, 10.0f, 0.0f, 0, GX_ENABLE, GX_ANISO_4);
++        break;
++    default:
++        GX_InitTexObjLOD(&texobj_a, GX_NEAR, GX_NEAR,
++                         0.0f, 0.0f, 0.0f, 0, 0, GX_ANISO_1);
++    }
 +    GX_LoadTexObj(&texobj_a, GX_TEXMAP0); // load texture object so its ready to use
 +}
 +
@@ -3194,10 +4003,10 @@ index 000000000..787e6ccc1
 +/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/video/ogc/SDL_ogcgxcommon.h b/src/video/ogc/SDL_ogcgxcommon.h
 new file mode 100644
-index 000000000..c47601d8d
+index 000000000..fe3360fe0
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcgxcommon.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,39 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -3223,22 +4032,26 @@ index 000000000..c47601d8d
 +#ifndef SDL_ogcgxcommon_h_
 +#define SDL_ogcgxcommon_h_
 +
++#include "SDL_render.h"
++
 +#include <gctypes.h>
 +
++#define GX_COLOR_AS_U32(c) *((u32*)&c)
++
 +void OGC_draw_init(int w, int h, int h_aspect, int v_aspect);
-+void OGC_prepare_texels(void *pixels, int w, int h, int pitch, Uint32 format,
-+                        void *texels, u8 *gx_format);
-+void OGC_load_texture(void *texels, int w, int h, u8 gx_format);
++void OGC_set_viewport(int x, int y, int w, int h, float h_aspect, float v_aspect);
++void OGC_load_texture(void *texels, int w, int h, u8 gx_format,
++                      SDL_ScaleMode scale_mode);
 +
 +#endif /* SDL_ogcgxcommon_h_ */
 +
 +/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/video/ogc/SDL_ogcpixels.c b/src/video/ogc/SDL_ogcpixels.c
 new file mode 100644
-index 000000000..b54690f54
+index 000000000..2d87b40d9
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcpixels.c
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,355 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -3265,6 +4078,38 @@ index 000000000..b54690f54
 +
 +#include <ogc/gx.h>
 +
++#define PIXELS_TO_TEXTURE_32(format_func) \
++    static void pixels_to_texture_ ## format_func( \
++        void *pixels, const SDL_Rect *rect, int16_t pitch, void *texture, int16_t tex_width) \
++    { \
++        int16_t tex_pitch = (tex_width + 3) / 4 * 4; \
++        for (int row = 0; row < rect->h; row++) { \
++            int y = rect->y + row; \
++            u32 *src = (u32 *)((u8 *)pixels + pitch * row); \
++            for (int col = 0; col < rect->w; col++) { \
++                int x = rect->x + col; \
++                u32 offset = (((y >> 2) << 4) * tex_pitch) + \
++                    ((x >> 2) << 6) + (((y % 4 << 2) + x % 4) << 1); \
++                set_pixel_to_texture_ ## format_func(texture, offset, *src++); \
++            } \
++        } \
++    }
++
++#define PIXELS_FROM_TEXTURE_32(format_func) \
++    static void pixels_from_texture_ ## format_func( \
++        void *pixels, int16_t w, int16_t h, int16_t pitch, void *texture) \
++    { \
++        int tex_width = (w + 3) / 4 * 4; \
++        for (int y = 0; y < h; y++) { \
++            u32 *dst = (u32 *)((u8 *)pixels + pitch * y); \
++            for (int x = 0; x < w; x++) { \
++                u32 offset = (((y >> 2) << 4) * tex_width) + \
++                    ((x >> 2) << 6) + (((y % 4 << 2) + x % 4) << 1); \
++                *dst++ = get_pixel_from_texture_ ## format_func(texture, offset); \
++            } \
++        } \
++    }
++
 +static u8 texture_format_from_SDL(const SDL_PixelFormatEnum format)
 +{
 +    switch (format) {
@@ -3274,6 +4119,8 @@ index 000000000..b54690f54
 +        return GX_TF_RGB565;
 +    case SDL_PIXELFORMAT_RGB24:
 +    case SDL_PIXELFORMAT_RGBA8888:
++    case SDL_PIXELFORMAT_ARGB8888:
++    case SDL_PIXELFORMAT_XRGB8888:
 +        return GX_TF_RGBA8;
 +    default:
 +        SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
@@ -3283,17 +4130,21 @@ index 000000000..b54690f54
 +    return 0xff; // invalid
 +}
 +
-+static inline void set_pixel_to_texture_32(int x, int y, u32 color, void *texture, int tex_width)
++static inline void set_pixel_to_texture_ARGB(void *texture, u32 offset, u32 color)
 +{
-+    u8 *tex = texture;
-+    u32 offset;
++    *(u16*)(texture + offset) = color >> 16;
++    *(u16*)(texture + offset + 32) = color;
++}
 +
-+    offset = (((y >> 2) << 4) * tex_width) + ((x >> 2) << 6) + (((y % 4 << 2) + x % 4) << 1);
++static inline u32 get_pixel_from_texture_ARGB(void *texture, u32 offset)
++{
++    return *(u16*)(texture + offset) << 16 |
++           *(u16*)(texture + offset + 32);
++}
 +
-+    *(tex + offset) = color;
-+    *(tex + offset + 1) = color >> 24;
-+    *(tex + offset + 32) = color >> 16;
-+    *(tex + offset + 33) = color >> 8;
++static inline void set_pixel_to_texture_RGBA(void *texture, u32 offset, u32 color)
++{
++    set_pixel_to_texture_ARGB(texture, offset, (color << 24) | (color >> 8));
 +}
 +
 +static inline u32 get_pixel_from_texture_32(int x, int y, void *texture, int tex_width)
@@ -3309,19 +4160,7 @@ index 000000000..b54690f54
 +           *(tex + offset + 33) << 8;
 +}
 +
-+static void pixels_RGBA_to_texture(void *pixels, int16_t w, int16_t h,
-+                                   int16_t pitch, void *texture)
-+{
-+    u32 *src = pixels;
-+
-+    int tex_width = (w + 3) / 4 * 4;
-+    for (int y = 0; y < h; y++) {
-+        src = (u32 *)((u8 *)pixels + pitch * y);
-+        for (int x = 0; x < w; x++) {
-+            set_pixel_to_texture_32(x, y, *src++, texture, tex_width);
-+        }
-+    }
-+}
++PIXELS_TO_TEXTURE_32(RGBA)
 +
 +static void pixels_RGBA_from_texture(void *pixels, int16_t w, int16_t h,
 +                                     int16_t pitch, void *texture)
@@ -3337,19 +4176,15 @@ index 000000000..b54690f54
 +    }
 +}
 +
-+static void pixels_XRGB_to_texture(void *pixels, int16_t w, int16_t h,
-+                                   int16_t pitch, void *texture)
-+{
-+    u32 *src = pixels;
++PIXELS_TO_TEXTURE_32(ARGB)
++PIXELS_FROM_TEXTURE_32(ARGB)
 +
-+    int tex_width = (w + 3) / 4 * 4;
-+    for (int y = 0; y < h; y++) {
-+        src = (u32 *)((u8 *)pixels + pitch * y);
-+        for (int x = 0; x < w; x++) {
-+            set_pixel_to_texture_32(x, y, (*src++) << 8 | 0xff, texture, tex_width);
-+        }
-+    }
++static inline void set_pixel_to_texture_XRGB(void *texture, u32 offset, u32 color)
++{
++    set_pixel_to_texture_ARGB(texture, offset, 0xff000000 | color);
 +}
++
++PIXELS_TO_TEXTURE_32(XRGB)
 +
 +static void pixels_XRGB_from_texture(void *pixels, int16_t w, int16_t h,
 +                                     int16_t pitch, void *texture)
@@ -3365,20 +4200,23 @@ index 000000000..b54690f54
 +    }
 +}
 +
-+static void pixels_RGB_to_texture(void *pixels, int16_t w, int16_t h,
-+                                  int16_t pitch, void *texture)
++static void pixels_RGB_to_texture(void *pixels, const SDL_Rect *rect,
++                                  int16_t pitch, void *texture, int16_t tex_width)
 +{
 +    u8 *src = pixels;
 +
-+    int tex_width = (w + 3) / 4 * 4;
-+    for (int y = 0; y < h; y++) {
-+        src = (u8 *)pixels + pitch * y;
-+        for (int x = 0; x < w; x++) {
++    int tex_pitch = (tex_width + 3) / 4 * 4;
++    for (int row = 0; row < rect->h; row++) {
++        int y = rect->y + row;
++        src = (u8 *)pixels + pitch * row;
++        for (int col = 0; col < rect->w; col++) {
++            int x = rect->x + col;
++            u32 offset = (((y >> 2) << 4) * tex_pitch) +
++                ((x >> 2) << 6) + (((y % 4 << 2) + x % 4) << 1);
 +            u8 r = *src++;
 +            u8 g = *src++;
 +            u8 b = *src++;
-+            set_pixel_to_texture_32(x, y, r << 24 | g << 16 | b << 8 | 0xff,
-+                                    texture, tex_width);
++            set_pixel_to_texture_ARGB(texture, offset, 0xff000000 | r << 16 | g << 8 | b);
 +        }
 +    }
 +}
@@ -3400,28 +4238,33 @@ index 000000000..b54690f54
 +    }
 +}
 +
-+static void pixels_16_to_texture(void *pixels, int16_t pitch, int16_t h,
-+                                 void *texture)
++static void pixels_16_to_texture(void *pixels, const SDL_Rect *rect, int16_t pitch,
++                                 void *texture, int16_t tex_width)
 +{
-+    long long int *dst = texture;
-+    long long int *src1 = pixels;
-+    long long int *src2 = (long long int *)((char *)pixels + (pitch * 1));
-+    long long int *src3 = (long long int *)((char *)pixels + (pitch * 2));
-+    long long int *src4 = (long long int *)((char *)pixels + (pitch * 3));
-+    int rowpitch = (pitch >> 3) * 3;
++    /* We only support coordinates multiple of 4. While we don't add support
++     * for arbitrary coordinates (TODO), let's restrict the paint area to the
++     * full 4x4 cells covered by the rect. In the future we can add code to
++     * fill up the remaining borders. */
++    int x0 = (rect->x + 3) & ~0x3;
++    int x1 = (rect->x + rect->w) & ~0x3;
++    int y0 = (rect->y + 3) & ~0x3;
++    int y1 = (rect->y + rect->h) & ~0x3;
++    int skipped_bytes_left = (x0 - rect->x) * 2;
++    int tex_pitch = tex_width * 2;
 +
-+    for (int y = 0; y < h; y += 4) {
-+        for (int x = 0; x < pitch; x += 8) {
++
++    for (int row = 0; row < y1 - y0; row += 4) {
++        u64 *src1 = pixels + (skipped_bytes_left + row * pitch);
++        u64 *src2 = (void*)src1 + (pitch * 1);
++        u64 *src3 = (void*)src1 + (pitch * 2);
++        u64 *src4 = (void*)src1 + (pitch * 3);
++        u64 *dst = texture + (x0 * 8 + (y0 + row) * tex_pitch);
++        for (int col = x0; col < x1; col += 4) {
 +            *dst++ = *src1++;
 +            *dst++ = *src2++;
 +            *dst++ = *src3++;
 +            *dst++ = *src4++;
 +        }
-+
-+        src1 = src4;
-+        src2 += rowpitch;
-+        src3 += rowpitch;
-+        src4 += rowpitch;
 +    }
 +}
 +
@@ -3499,26 +4342,27 @@ index 000000000..b54690f54
 +}
 +
 +void OGC_pixels_to_texture(void *pixels, const SDL_PixelFormatEnum format,
-+                           int16_t w, int16_t h, int16_t pitch,
-+                           void *texture, u8 *gx_format)
++                           const SDL_Rect *rect, int16_t pitch,
++                           void *texture, int16_t tex_width)
 +{
-+    *gx_format = texture_format_from_SDL(format);
-+
 +    switch (format) {
 +    case SDL_PIXELFORMAT_INDEX8:
-+        pixels_8_to_texture(pixels, w, h, pitch, texture);
++        pixels_8_to_texture(pixels, rect->w, rect->h, pitch, texture);
 +        break;
 +    case SDL_PIXELFORMAT_RGB565:
-+        pixels_16_to_texture(pixels, pitch, h, texture);
++        pixels_16_to_texture(pixels, rect, pitch, texture, tex_width);
 +        break;
 +    case SDL_PIXELFORMAT_RGB24:
-+        pixels_RGB_to_texture(pixels, w, h, pitch, texture);
++        pixels_RGB_to_texture(pixels, rect, pitch, texture, tex_width);
 +        break;
 +    case SDL_PIXELFORMAT_RGBA8888:
-+        pixels_RGBA_to_texture(pixels, w, h, pitch, texture);
++        pixels_to_texture_RGBA(pixels, rect, pitch, texture, tex_width);
++        break;
++    case SDL_PIXELFORMAT_ARGB8888:
++        pixels_to_texture_ARGB(pixels, rect, pitch, texture, tex_width);
 +        break;
 +    case SDL_PIXELFORMAT_XRGB8888:
-+        pixels_XRGB_to_texture(pixels, w, h, pitch, texture);
++        pixels_to_texture_XRGB(pixels, rect, pitch, texture, tex_width);
 +        break;
 +    default:
 +        SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
@@ -3544,6 +4388,9 @@ index 000000000..b54690f54
 +    case SDL_PIXELFORMAT_RGBA8888:
 +        pixels_RGBA_from_texture(pixels, w, h, pitch, texture);
 +        break;
++    case SDL_PIXELFORMAT_ARGB8888:
++        pixels_from_texture_ARGB(pixels, w, h, pitch, texture);
++        break;
 +    case SDL_PIXELFORMAT_XRGB8888:
 +        pixels_XRGB_from_texture(pixels, w, h, pitch, texture);
 +        break;
@@ -3554,13 +4401,18 @@ index 000000000..b54690f54
 +    }
 +}
 +
++u8 OGC_texture_format_from_SDL(const SDL_PixelFormatEnum format)
++{
++    return texture_format_from_SDL(format);
++}
++
 +/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/video/ogc/SDL_ogcpixels.h b/src/video/ogc/SDL_ogcpixels.h
 new file mode 100644
-index 000000000..f036e7f80
+index 000000000..c92d032aa
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcpixels.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,42 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -3587,25 +4439,28 @@ index 000000000..f036e7f80
 +#define SDL_ogcpixels_h_
 +
 +#include "SDL_pixels.h"
++#include "SDL_rect.h"
 +
 +#include <gctypes.h>
 +
 +void OGC_pixels_to_texture(void *pixels, SDL_PixelFormatEnum format,
-+                           int16_t w, int16_t h, int16_t pitch,
-+                           void *texels, u8 *gx_format);
++                           const SDL_Rect *rect, int16_t pitch,
++                           void *texels, int16_t tex_width);
 +void OGC_pixels_from_texture(void *pixels, SDL_PixelFormatEnum format,
 +                             int16_t w, int16_t h, int16_t pitch,
 +                             void *texels);
++
++u8 OGC_texture_format_from_SDL(const SDL_PixelFormatEnum format);
 +
 +#endif /* SDL_ogcpixels_h_ */
 +
 +/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/video/ogc/SDL_ogcvideo.c b/src/video/ogc/SDL_ogcvideo.c
 new file mode 100644
-index 000000000..22db5c4ca
+index 000000000..b86da4ec6
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcvideo.c
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,197 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -3716,7 +4571,7 @@ index 000000000..22db5c4ca
 +
 +    /* Allocate the XFB */
 +    videodata->xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(vmode));
-+    videodata->xfb[1] = NULL; /* We'll allocate this when double-buffering */
++    videodata->xfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(vmode));
 +
 +    VIDEO_ClearFrameBuffer(vmode, videodata->xfb[0], COLOR_BLACK);
 +    VIDEO_SetNextFramebuffer(videodata->xfb[0]);
@@ -3726,9 +4581,6 @@ index 000000000..22db5c4ca
 +    videodata->gp_fifo = memalign(32, DEFAULT_FIFO_SIZE);
 +    memset(videodata->gp_fifo, 0, DEFAULT_FIFO_SIZE);
 +    GX_Init(videodata->gp_fifo, DEFAULT_FIFO_SIZE);
-+
-+    GX_SetViewport(0, 0, vmode->fbWidth, vmode->efbHeight, 0, 1);
-+    GX_SetScissor(0, 0, vmode->fbWidth, vmode->efbHeight);
 +
 +    /* Setup the EFB -> XFB copy operation */
 +    GX_SetDispCopySrc(0, 0, vmode->fbWidth, vmode->efbHeight);
@@ -3741,7 +4593,7 @@ index 000000000..22db5c4ca
 +                    ((vmode->viHeight == 2 * vmode->xfbHeight) ? GX_ENABLE : GX_DISABLE));
 +    GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
 +    GX_SetCullMode(GX_CULL_NONE);
-+    GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
++    GX_SetBlendMode(GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 +
 +    GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 +
@@ -3780,15 +4632,38 @@ index 000000000..22db5c4ca
 +        free(MEM_K1_TO_K0(videodata->xfb[1]));
 +}
 +
++void *OGC_video_get_xfb(_THIS)
++{
++    SDL_VideoData *videodata = _this->driverdata;
++    return videodata->xfb[videodata->fb_index];
++}
++
++void OGC_video_flip(_THIS, bool vsync)
++{
++    SDL_VideoData *videodata = _this->driverdata;
++    void *xfb = OGC_video_get_xfb(_this);
++    GX_CopyDisp(xfb, GX_TRUE);
++    GX_DrawDone();
++    GX_Flush();
++
++    VIDEO_SetNextFramebuffer(xfb);
++    VIDEO_Flush();
++    if (vsync) {
++        VIDEO_WaitVSync();
++    }
++
++    videodata->fb_index ^= 1;
++}
++
 +#endif /* SDL_VIDEO_DRIVER_OGC */
 +
 +/* vi: set ts=4 sw=4 expandtab: */
 diff --git a/src/video/ogc/SDL_ogcvideo.h b/src/video/ogc/SDL_ogcvideo.h
 new file mode 100644
-index 000000000..b653f12bc
+index 000000000..3821d1966
 --- /dev/null
 +++ b/src/video/ogc/SDL_ogcvideo.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,50 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2023 Sam Lantinga <slouken@libsdl.org>
@@ -3823,6 +4698,7 @@ index 000000000..b653f12bc
 +    GXRModeObj *vmode;
 +    u8 *gp_fifo;
 +    void *xfb[2];
++    u8 fb_index;
 +} SDL_VideoData;
 +
 +typedef struct SDL_WindowData
@@ -3831,6 +4707,9 @@ index 000000000..b653f12bc
 +    u8 *texels;
 +    SDL_PixelFormatEnum surface_format;
 +} SDL_WindowData;
++
++void *OGC_video_get_xfb(SDL_VideoDevice *device);
++void OGC_video_flip(SDL_VideoDevice *device, bool vsync);
 +
 +#endif /* SDL_ogcvideo_h_ */
 +
