@@ -2093,7 +2093,7 @@ index 000000000..f0d42bed9
 +/* vi: set sts=4 ts=4 sw=4 expandtab: */
 diff --git a/src/main/wii/SDL_wii_main.c b/src/main/wii/SDL_wii_main.c
 new file mode 100644
-index 000000000..d25d7ee21
+index 000000000..9a42125aa
 --- /dev/null
 +++ b/src/main/wii/SDL_wii_main.c
 @@ -0,0 +1,91 @@
@@ -2180,7 +2180,7 @@ index 000000000..d25d7ee21
 +    if (!argv || argv[0] == NULL) {
 +        static const char *dummy_argv[2] = { "app", NULL };
 +        argc = 1;
-+        argv = dummy_argv;
++        argv = (char**)dummy_argv;
 +    }
 +    return SDL_main(argc, argv);
 +}
